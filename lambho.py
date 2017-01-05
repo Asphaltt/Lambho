@@ -4,6 +4,7 @@ import re
 import sys
 import asyncio
 import uvloop
+import logging
 
 from time import time
 from inspect import isawaitable
@@ -42,32 +43,17 @@ class AppStack(list):
 
 
 app = default_app = AppStack()
+logger = logging.getLogger(__name__)
 
 
 # --- config start ---
 class Config(dict):
-    LOGO = """ Lambho is a hyper sport car...
-````````````````````````````````````````````````````````````````````````````````````````````````````
-``````````````````````````````````````````````    ```   ```     ````                  ``    `` ```
-                                                           ````--.--------------------......`..
-                                         ``.-:://++ooooo+++oooosssssyyyyyyyysooooddssssssssssd+
-                                   ````.```````...::/ossyyysshdmddddmmmmmNNNddhs+/:``       `+.
-                              `.....````    ``-ossyyyhhddyydmdhhdhdddmmmyhmhhhymMNmhso+//:.`
-                          `---..-:.```..-:/osyhddddddddhymmddhhsssyhdmmmddhhysoyNNmmhhhhhhs+-
-                     ```.//oo/:+osossssyyhhdddddmmmmmdydmyyhmmhhddddddhhhhyyhhmNNNmyo+///oymy+`
-               `.-://+o+::--:::/+++++oo++++++o+/::::/+yhhyhddmdmhhhhhyyyyhhdhmNNNms//+oshdMMMd-
-             .:+/syhdmhhs:.`.:o++so+oyyoso/:-..:/+syhhhhyyysoosyyssyyhddddhdNNNNmsoshhhmyNNMMM.
-           .+o++/oydhs+-.-+ydddmmhhddyo/://+osyyhhhhhhdmNNmhss+osdddmmdddddNNNNdydddddNmhNMNMN-
-        `..ooooo+///////++oo+oooooooooooosshhyhhhhhhdmNMMMNNdhddddmmmmdddhdNMMmhdddddmMNdNNMNm.
-       `-/osssooooooooooooossyysssooooo::/syhhhhyyhhdNNNNMMMNhdmmddddhhyyyyhysssmmdymNMNNdNNmy..````
-      `/shhhyyyyhyyyyyyyyyysso++++++o+::shhhhhhhdddhNNMMMMNMMddmmmddysoososyhdNNyyyyhdMMMNmms/::----
-    `.yddddddhddhhhysooooo+++//::::/oyhddhhhhhdmNmhNNMMNMNNNdddmhshhhddmmmmmmmdmmmmmmmmdhhso+///:::
-   `  .+dmdmdddhhyys+/++////////+oshhddmmmmmdydmmMNmdNNNMNNmmdmmmdmmmmmmNNNmmmddhyyyhhdhhhyso+/:::::
-```  `/shyydmmmNmmNNmNMMNmmNMMMmmNMMNmmmmmmdhdmmmMMNmmNNNNmmNyhmNNNNNmmmmmdddddhhyyyyyysoo++////////
-....../oysyhmNMMMhNNmmmmmmdmmmmNmmNNmNNNmddhsshddNMMNNmmNNmmNNmmmmmmmddddddhhhhhyysssssosooooo+++ooo
-------:oyhmmdddmdsdmNNmNNNNNmNMNNNmmNmh+yhhyhhddmNMMNNNNNmmmmddddddddhhhhhhyyssssssssyyyyyyyyyyyyyyy
-///////+osyyhddmmmmmmmmmmmmmmmmmmmmmmmmNNNNNNmmmmmmmddddddhhhhhddhhhhhhyyyyyyyyyyyyyyyhhhhhhhhhhhhhh
-oooooooosyyyhhhhhhhddddddmmmmmmmmmmmmmdddddhhhhhhdddhhhhhhhhhhhhhhhhhhhhhhhhhhhhddddddddddmmmmdddmmm
+    LOGO = """
+______                   ______ ______
+___  / ______ _______ ______  /____  /_______
+__  /  _  __ `/_  __ `__ \_  __ \_  __ \  __ \\
+_  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /
+/_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/
     """
     ROUTE_CACHE_SIZE = 1024
 # --- config end ---
@@ -301,11 +287,20 @@ class Handler:
 
 class Lambho(object):
 
-    def __init__(self, name=None, router=None, error_handler=None, config=None):
+    def __init__(self, name=None, router=None, error_handler=None, config=None,
+        logger=None):
+        if logger is None:
+            logging.basicConfig(
+                level=logging.INFO,
+                format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
+            )
+
         self.name = name or "Lambho"
         self.router = router or Router()
         self.config = config or Config()
         self.error_handler = error_handler or Handler()
+
+        self.config.setdefault('DEBUG', False)
 
     def add_route(self, uri, methods, handler):
         self.router.add(uri=uri, methods=methods, handler=handler)
@@ -428,9 +423,7 @@ class Server(asyncio.Protocol):
             self.transport.write(response.output(self.request.version))
             self.transport.close()
         except Exception as e:
-            print("Excepting while writing response.")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Excepting while writing response.")
 
     def write_error(self, exception):
         try:
@@ -439,7 +432,7 @@ class Server(asyncio.Protocol):
             self.transport.write(response.output(version))
             self.transport.close()
         except Exception as e:
-            print("Excepting while writing error.")
+            logger.exception("Excepting while writing error.")
 
     def close_if_idle(self):
         if not self.parser:
@@ -449,11 +442,18 @@ class Server(asyncio.Protocol):
 
 
 def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
-        request_max_size=None, reuse_port=False, server=None, loop=None):
+        request_max_size=None, reuse_port=False, server=None, loop=None,
+        debug=False):
     app = app or default_app()
     server = server or Server
     loop = loop or uvloop.new_event_loop()
     asyncio.set_event_loop(loop)
+
+    if debug:
+        app.config['DEBUG'] = True
+        logger.setLevel(logging.DEBUG)
+    else:
+        logger.setLevel(logging.INFO)
 
     connections = set()
     signal = Signal()
@@ -478,15 +478,15 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
     try:
         http_server = loop.run_until_complete(coro)
     except Exception:
-        print("Unable to start server")
+        logger.error("Unable to start server")
         return
 
     for _signal in (SIGINT, SIGTERM):
         loop.add_signal_handler(_signal, loop.stop)
 
     try:
-        print(Config.LOGO)
-        print('Running ...\nAccess by http://{}:{}'.format(host, port))
+        logger.debug(Config.LOGO)
+        logger.info('Running ...\nAccess by http://{}:{}'.format(host, port))
         loop.run_forever()
 
     except KeyboardInterrupt:

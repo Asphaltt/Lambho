@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # encoding: utf-8
+import re
 import sys
 import asyncio
 import uvloop
@@ -7,7 +8,7 @@ import uvloop
 from time import time
 from inspect import isawaitable
 from signal import SIGINT, SIGTERM
-from functools import wraps, partial
+from functools import wraps, partial, lru_cache
 from collections import namedtuple, defaultdict
 from httptools import HttpRequestParser, parse_url
 
@@ -43,31 +44,154 @@ class AppStack(list):
 app = default_app = AppStack()
 
 
-Route = namedtuple('Route', "handler, pattern, methods")
+# --- config start ---
+class Config(dict):
+    LOGO = """ Lambho is a hyper sport car...
+````````````````````````````````````````````````````````````````````````````````````````````````````
+``````````````````````````````````````````````    ```   ```     ````                  ``    `` ```
+                                                           ````--.--------------------......`..
+                                         ``.-:://++ooooo+++oooosssssyyyyyyyysooooddssssssssssd+
+                                   ````.```````...::/ossyyysshdmddddmmmmmNNNddhs+/:``       `+.
+                              `.....````    ``-ossyyyhhddyydmdhhdhdddmmmyhmhhhymMNmhso+//:.`
+                          `---..-:.```..-:/osyhddddddddhymmddhhsssyhdmmmddhhysoyNNmmhhhhhhs+-
+                     ```.//oo/:+osossssyyhhdddddmmmmmdydmyyhmmhhddddddhhhhyyhhmNNNmyo+///oymy+`
+               `.-://+o+::--:::/+++++oo++++++o+/::::/+yhhyhddmdmhhhhhyyyyhhdhmNNNms//+oshdMMMd-
+             .:+/syhdmhhs:.`.:o++so+oyyoso/:-..:/+syhhhhyyysoosyyssyyhddddhdNNNNmsoshhhmyNNMMM.
+           .+o++/oydhs+-.-+ydddmmhhddyo/://+osyyhhhhhhdmNNmhss+osdddmmdddddNNNNdydddddNmhNMNMN-
+        `..ooooo+///////++oo+oooooooooooosshhyhhhhhhdmNMMMNNdhddddmmmmdddhdNMMmhdddddmMNdNNMNm.
+       `-/osssooooooooooooossyysssooooo::/syhhhhyyhhdNNNNMMMNhdmmddddhhyyyyhysssmmdymNMNNdNNmy..````
+      `/shhhyyyyhyyyyyyyyyysso++++++o+::shhhhhhhdddhNNMMMMNMMddmmmddysoososyhdNNyyyyhdMMMNmms/::----
+    `.yddddddhddhhhysooooo+++//::::/oyhddhhhhhdmNmhNNMMNMNNNdddmhshhhddmmmmmmmdmmmmmmmmdhhso+///:::
+   `  .+dmdmdddhhyys+/++////////+oshhddmmmmmdydmmMNmdNNNMNNmmdmmmdmmmmmmNNNmmmddhyyyhhdhhhyso+/:::::
+```  `/shyydmmmNmmNNmNMMNmmNMMMmmNMMNmmmmmmdhdmmmMMNmmNNNNmmNyhmNNNNNmmmmmdddddhhyyyyyysoo++////////
+....../oysyhmNMMMhNNmmmmmmdmmmmNmmNNmNNNmddhsshddNMMNNmmNNmmNNmmmmmmmddddddhhhhhyysssssosooooo+++ooo
+------:oyhmmdddmdsdmNNmNNNNNmNMNNNmmNmh+yhhyhhddmNMMNNNNNmmmmddddddddhhhhhhyyssssssssyyyyyyyyyyyyyyy
+///////+osyyhddmmmmmmmmmmmmmmmmmmmmmmmmNNNNNNmmmmmmmddddddhhhhhddhhhhhhyyyyyyyyyyyyyyyhhhhhhhhhhhhhh
+oooooooosyyyhhhhhhhddddddmmmmmmmmmmmmmdddddhhhhhhdddhhhhhhhhhhhhhhhhhhhhhhhhhhhhddddddddddmmmmdddmmm
+    """
+    ROUTE_CACHE_SIZE = 1024
+# --- config end ---
+
+
+# --- route rules start ---
+Route = namedtuple('Route', "handler, pattern, methods, parameters")
+Parameter = namedtuple('Parameter', "name, type")
+
+REGEXP_TYPES = {
+    "string": (str, r'[^/]+'),
+    "int": (int, r'\d+'),
+    "number": (float, r'[0-9\\.]+'),
+    "alpha": (str, r'[A-Za-z]+'),
+    "alphanum": (str, r'[A-Za-z0-9]+')
+}
+
+
+def url_hash(url):
+    return url.count('/')
 
 
 class Router:
+    """
+    Router collects all route rules, which supports basic routing with
+    parameters and methods. Parameters will be passed as keyword arguments
+    to request handler function, which can have a type by appending :type
+    in <parameter>, like the following usage. IF `type` is not provided,
+    it defaults *string*. The `type` must be one of *string*, *int*, *number*,
+    *alpha* and *alphanum* if it's provided.
+    Usage:
+        @lambho.get('/for/example/<parameter>')
+        def exam(request, parameter):
+            pass
+    or
+        @lambho.route('/for/example/<parameter:type>', methods=['GET', 'POST', ...])
+        def exam(request, parameter):
+            pass
+    """
 
     def __init__(self):
         self.all_routes = {}
         self.static_routes = {}
         self.dynamic_routes = defaultdict(list)
 
-    def add(self, handler, methods, pattern):
-        route = Route(handler=handler, pattern=pattern, methods=methods)
-        for meth in methods:
-            self.static_routes[meth + pattern] = route
+    def add(self, uri, methods, handler):
+        """
+        Add a handler to the route list.
+        :param uri: Route path to match
+        :param methods: Array methods to be checked
+            If none are provided, any method is allowed
+        :param handler: Request handler function
+        :return:
+        """
+        if uri in self.all_routes:
+            raise RouteError("Route has been registered: {}".format(uri))
+
+        # frozenset for faster lookup
+        if methods:
+            methods = frozenset(methods)
+
+        parameters= []
+
+        def add_parameter(match):
+            param = match.group(1)
+            pattern = "string"
+            if ':' in param:
+                param, pattern = param.split(':', 1)
+
+            _default = (str, pattern)
+            _type, pattern = REGEXP_TYPES.get(pattern, _default)
+            parameters.append(Parameter(name=param, type=_type))
+            return "({})".format(pattern)
+
+        pattern_re = re.sub(r'<(.+?)>', add_parameter, uri)
+        pattern = re.compile(r'^{}$'.format(pattern_re))
+
+        route = Route(handler=handler, pattern=pattern,
+                      methods=methods, parameters=parameters)
+
+        self.all_routes[uri] = route
+        if parameters:
+            self.dynamic_routes[url_hash(uri)].append(route)
+        else:
+            self.static_routes[uri] = route
 
     def get(self, request):
+        """
+        Gets a request handler based on the URL of the request, or raises an
+            error
+        :param request: Request object
+        :return: handler, arguments, keyword arguments
+        """
         return self._get(request.url, request.method)
 
+    @lru_cache(Config.ROUTE_CACHE_SIZE)
     def _get(self, url, method):
-        route = self.static_routes.get(method + url)
-        if route is None:
-            return None, [], {}
-        return route.handler, [], {}
+        """
+        Gets a request handler based on the URL of the request, or raises an
+            error
+        :param request: Request object
+        :return: handler, arguments, keyword arguments
+        """
+        route = self.static_routes.get(url)
+        if route:
+            match = route.pattern.match(url)
+        else:
+            for route in self.dynamic_routes[url_hash(url)]:
+                match = route.pattern.match(url)
+                if match:
+                    break
+            else:
+                raise HTTPError(404, 'Not found {}.'.format(url))
+
+        if route.methods and method not in route.methods:
+            raise HTTPError(405, 'Method not found.')
+
+        kwargs = {p.name: p.type(value) for value, p
+                  in zip(match.groups(1), route.parameters)}
+        return route.handler, [], kwargs
+# --- route rules end ---
 
 
+# --- request and response start ---
 class BaseRequest:
 
     def __init__(self, url_bytes, headers, version, method):
@@ -133,17 +257,34 @@ class BaseResponse:
 
 
 Response = BaseResponse
+# --- request and response end ---
 
 
+# --- exceptions start ---
 class LambhoError(Exception):
+    pass
+
+
+class RouteError(LambhoError):
+    pass
+
+
+class ServerError(LambhoError):
 
     status_code = None
 
-    def __init__(self, message, status_code=None):
+    def __init__(self, status_code=None, message=''):
         super().__init__(message)
         self.status_code = status_code
+        self.message = message
 
 
+class HTTPError(ServerError):
+    pass
+# --- exceptions end ---
+
+
+# --- application start ---
 class Handler:
 
     def __init__(self):
@@ -158,36 +299,32 @@ class Handler:
         return Response("An error occurred while requesting.", status=500)
 
 
-class ServerError(LambhoError):
-    status_code = 500
-
-
 class Lambho(object):
 
-    def __init__(self, name=None, router=None, error_handler=None):
+    def __init__(self, name=None, router=None, error_handler=None, config=None):
         self.name = name or "Lambho"
         self.router = router or Router()
+        self.config = config or Config()
         self.error_handler = error_handler or Handler()
 
-    def add_route(self, path, methods, handler):
-        self.router.add(handler=handler, methods=methods, pattern=path)
+    def add_route(self, uri, methods, handler):
+        self.router.add(uri=uri, methods=methods, handler=handler)
 
-    def route(self, path, method='GET'):
+    def route(self, uri, methods=None):
         def decorator(handler):
-            methods = _makelist(method)
-            self.add_route(path, methods, handler)
+            self.add_route(uri, methods, handler)
             return handler
         return decorator
 
-    def get(self, path, *a, **kw):
-        return self.route(path, *a, **kw)
+    def get(self, uri):
+        return self.route(uri, methods=['GET'])
 
     async def request_handler(self, request, response_callback):
         handler, args, kwargs = self.router.get(request)
 
         if handler is None:
-            raise ServerError(("'None' was returned while requesting "
-                               "a handler from the router"))
+            raise ServerError(500, ("'None' was returned while requesting "
+                "a handler from the router"))
 
         response = handler(request, *args, **kwargs)
         if isawaitable(response):
@@ -195,6 +332,7 @@ class Lambho(object):
         response = Response(response)
 
         response_callback(response)
+# --- application end ---
 
 
 def wrapper_default_app_method(name):
@@ -347,6 +485,7 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         loop.add_signal_handler(_signal, loop.stop)
 
     try:
+        print(Config.LOGO)
         print('Running ...\nAccess by http://{}:{}'.format(host, port))
         loop.run_forever()
 
@@ -357,7 +496,6 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
     except:
         sys.exit(3)
     finally:
-        print("Stopping ...")
         http_server.close()
         loop.run_until_complete(http_server.wait_closed())
 

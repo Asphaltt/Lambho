@@ -2,25 +2,24 @@
 # encoding: utf-8
 import re
 import sys
+import time
 import asyncio
 import uvloop
 import logging
 
-from time import time
+from cgi import parse_header
 from inspect import isawaitable
+from httptools import parse_url
+from mimetypes import guess_type
+from urllib.parse import parse_qs
+from multidict import CIMultiDict
 from signal import SIGINT, SIGTERM
+from http.cookies import SimpleCookie
+from aiofiles import open as open_async
 from functools import wraps, partial, lru_cache
 from collections import namedtuple, defaultdict
 from httptools import HttpRequestParser, parse_url
-
-
-def _makelist(item):
-    if isinstance(item, (tuple, list, set, dict)):
-        return list(item)
-    elif item:
-        return [item]
-    else:
-        return []
+from ujson import dumps as json_dumps, loads as json_loads
 
 
 class AppStack(list):
@@ -42,7 +41,7 @@ class AppStack(list):
             return self.push()
 
 
-app = default_app = AppStack()
+default_app = AppStack()
 logger = logging.getLogger(__name__)
 
 
@@ -50,10 +49,10 @@ logger = logging.getLogger(__name__)
 class Config(dict):
     LOGO = """
 ______                   ______ ______
-___  / ______ _______ ______  /____  /_______
-__  /  _  __ `/_  __ `__ \_  __ \_  __ \  __ \\
-_  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /
-/_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/
+___  / ______ _______ ______  /____  /_______      ▁▁▁▁▁▁▁▁▁▁▁▁▁
+__  /  _  __ `/_  __ `__ \\_  __ \\_  __ \\  __ \\    /            /
+_  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /   /  Run fast! /
+/_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/   /▁▁▁▁▁▁▁▁▁▁▁▁/
     """
     ROUTE_CACHE_SIZE = 1024
 # --- config end ---
@@ -109,7 +108,7 @@ class Router:
         :return:
         """
         if uri in self.all_routes:
-            raise RouteError("Route has been registered: {}".format(uri))
+            raise LambhoError("Route has been registered: {}".format(uri))
 
         # frozenset for faster lookup
         if methods:
@@ -166,10 +165,10 @@ class Router:
                 if match:
                     break
             else:
-                raise HTTPError(404, 'Not found {}.'.format(url))
+                raise ServerError('Not found {}.'.format(url), 404)
 
         if route.methods and method not in route.methods:
-            raise HTTPError(405, 'Method not found.')
+            raise ServerError('Method not found.', 405)
 
         kwargs = {p.name: p.type(value) for value, p
                   in zip(match.groups(1), route.parameters)}
@@ -178,9 +177,39 @@ class Router:
 
 
 # --- request and response start ---
-class BaseRequest:
+DEFAULT_HTTP_CONTENT_TYPE = "application/octet-stream"
+# HTTP/1.1: https://www.w3.org/Protocols/rfc2616/rfc2616-sec7.html#sec7.2.1
+# > If the media type remains unknown, the recipient SHOULD treat it
+# > as type "application/octet-stream"
 
-    def __init__(self, url_bytes, headers, version, method):
+
+class RequestParameters(dict):
+
+    def __init__(self, *args, **kwargs):
+        self.super = super()
+        self.super.__init__(*args, **kwargs)
+
+    def get(self, name, default=None):
+        values = self.super.get(name)
+        return values[0] if values else default
+
+    def getlist(self, name, default=None):
+        return self.super.get(name, default)
+
+
+class BaseRequest:
+    """
+    BaseRequest get properties of an HTTP request,
+    such as url, headers, form data, etc.
+    """
+    __slots__ = (
+        'app', 'url', 'headers', 'version', 'method', '_cookies',
+        'query_string', 'body',
+        'parsed_json', 'parsed_args', 'parsed_form', 'parsed_files',
+    )
+
+    def __init__(self, app, url_bytes, headers, version, method):
+        self.app = app
         url_parsed = parse_url(url_bytes)
         self.url = url_parsed.path.decode('utf-8')
         self.headers = headers
@@ -197,16 +226,136 @@ class BaseRequest:
         self.parsed_args = None
         self._cookies = None
 
+    @property
+    def json(self):
+        if not self.parsed_json:
+            try:
+                self.parsed_json = json_loads(self.body)
+            except Exception:
+                raise InvalidUsage("Failed when parsing body as json")
+
+        return self.parsed_json
+
+    @property
+    def form(self):
+        if self.parsed_form is None:
+            self.parsed_form = RequestParameters()
+            self.parsed_files = RequestParameters()
+            content_type = self.headers.get(
+                'Content-Type', DEFAULT_HTTP_CONTENT_TYPE)
+            content_type, parameters = parse_header(content_type)
+            try:
+                if content_type == 'application/x-www-form-urlencoded':
+                    self.parsed_form = RequestParameters(
+                        parse_qs(self.body.decode('utf-8')))
+                elif content_type == 'multipart/form-data':
+                    boundary = parameters['boundary'].encode('utf-8')
+                    self.parsed_form, self.parsed_files = (
+                        parse_multipart_form(self.body, boundary))
+            except Exception:
+                logger.exception("Failed when parsing form")
+
+        return self.parsed_form
+
+    @property
+    def files(self):
+        if self.parsed_files is None:
+            self.form
+
+        return self.parsed_files
+
+    @property
+    def args(self):
+        if self.parsed_args is None:
+            if self.query_string:
+                self.parsed_args = RequestParameters(
+                    parse_qs(self.query_string))
+            else:
+                self.parsed_args = {}
+
+        return self.parsed_args
+
+    @property
+    def cookies(self):
+        if self._cookies is None:
+            cookie = self.headers.get('Cookie') or self.headers.get('cookie')
+            if cookie is not None:
+                cookies = SimpleCookie()
+                cookies.load(cookie)
+                self._cookies = {name: cookie.value
+                                 for name, cookie in cookies.items()}
+            else:
+                self._cookies = {}
+        return self._cookies
+
+
+File = namedtuple('File', "type, body, name")
+
+
+def parse_multipart_form(body, boundary):
+    """
+    Parses a request body and returns fields and files
+    :param body: Bytes request body
+    :param boundary: Bytes multipart boundary
+    :return: fields (RequestParameters), files (RequestParameters)
+    """
+    files = RequestParameters()
+    fields = RequestParameters()
+
+    form_parts = body.split(boundary)
+    for form_part in form_parts[1:-1]:
+        file_name, file_type, field_name = None, None, None
+        line_index, line_end_index = 2, 0
+        while not line_end_index == -1:
+            line_end_index = form_part.find(b'\r\n', line_index)
+            form_line = form_part[line_index:line_end_index].decode('utf-8')
+            line_index = line_end_index + 2
+
+            if not form_line:
+                break
+
+            colon_index = form_line.index(':')
+            form_header_field = form_line[0:colon_index]
+            form_header_value, form_parameters = parse_header(
+                form_line[colon_index + 2:])
+
+            if form_header_field == 'Content-Disposition':
+                if 'filename' in form_parameters:
+                    file_name = form_parameters['filename']
+                field_name = form_parameters.get('name')
+            elif form_header_field == 'Content-Type':
+                file_type = form_header_value
+
+        post_data = form_part[line_index:-4]
+        if file_name or file_type:
+            file = File(type=file_type, name=file_name, body=post_data)
+            if field_name in files:
+                files[field_name].append(file)
+            else:
+                files[field_name] = [file]
+        else:
+            value = post_data.decode('utf-8')
+            if field_name in fields:
+                fields[field_name].append(value)
+            else:
+                fields[field_name] = [value]
+
+    return fields, files
+
 
 Request = BaseRequest
 
 
 class BaseResponse:
-    __slots__ = ('body', 'status', 'content_type', 'headers', '_cookies')
+    """
+    Basic response of an HTTP request.
+    """
+    __slots__ = ('body', 'status', 'message', 'content_type', 'headers', '_cookies')
 
     def __init__(self, body=None, status=200, content_type='text/plain',
-                 headers=None, body_bytes=b''):
+                 headers=None, message=b'OK', body_bytes=b''):
         self.status = status
+        self.message = message
         self.content_type = content_type
         self.headers = headers or {}
         self._cookies = None
@@ -225,48 +374,126 @@ class BaseResponse:
             headers = b''.join(
                 b'%b: %b\r\n' % (name.encode(), value.encode('utf-8'))
                 for name, value in self.headers.iteritems())
-        return (b'HTTP/%b %d %b\r\n'
-                b'Content-Type: %b\r\n'
-                b'Content-Length: %d\r\n'
-                b'Connection: %b\r\n'
-                b'%b\r\n'
-                b'%b') % (
-            version.encode(),
-            self.status,
-            b'ok',
-            self.content_type.encode(),
-            len(self.body),
-            b'keep-alive' if keep_alive else b'close',
-            headers,
-            self.body
-        )
+        return (
+            b'HTTP/%b %d %b\r\n'
+            b'Content-Type: %b\r\n'
+            b'Content-Length: %d\r\n'
+            b'Connection: %b\r\n'
+            b'%b\r\n'
+            b'%b') % (
+                version.encode(),
+                self.status,
+                self.message,
+                self.content_type.encode(),
+                len(self.body),
+                b'keep-alive' if keep_alive else b'close',
+                headers,
+                self.body)
+
+
+class HTTPError(BaseResponse):
+
+    def __init__(self, status, message):
+        super().__init__(status=status, message=message)
 
 
 Response = BaseResponse
+
+
+def json(body, status=200, headers=None):
+    return Response(json_dumps(body), headers=headers, status=status,
+                        content_type="application/json")
+
+
+def text(body, status=200, headers=None):
+    return Response(body, status=status, headers=headers,
+                        content_type="text/plain; charset=utf-8")
+
+
+def html(body, status=200, headers=None):
+    return Response(body, status=status, headers=headers,
+                        content_type="text/html; charset=utf-8")
+
+
+async def file(filename, mimetype=True, headers=None,
+    download=False, charset='utf-8'):
+    """
+    Open a file in an async way and return an instance of *Response*.
+
+    :param filename: A file to be opened and returned.
+    :param mimetype: If True, guess mimetype and encoding from
+        filename or download if download is provided as filename.
+    :param headers: A dict to keep the response headers.
+    :param download: If True, ask browser open a "Save as ..." dialog
+        to save the file instead of opening with associated program.
+        It can be a custom string as the filename. Otherwise,
+        the original filename is used. (default: False)
+    :param charset: The charset is with "text/*" in mimetype.
+        (default: utf-8)
+    :return: A http error with status code 404 or 403, if "../" in the
+        filename or the file does not exist or you have no access
+        permission of the file. Or a Response is returned.
+    """
+    headers = headers or {}
+
+    if '../' in filename:
+        return HTTPError(404, "Invalid file to access.")
+    else:
+        filename = os.path.abspath(filename)
+
+    if not os.path.exists(filename) or not os.path.isfile(filename):
+        return HTTPError(404, "File does not exist.")
+    if not os.access(filename, os.R_OK):
+        return HTTPError(403, "You do not have permission to access this file.")
+
+    if mimetype is True:
+        if download and download is not True:
+            mimetype, encoding = mimetypes.guess_type(download)
+        else:
+            mimetype, encoding = mimetypes.guess_type(filename)
+        if encoding:
+            headers['Content-Encoding'] = encoding
+
+    if mimetype:
+        if (mimetype[:5] == 'text/' or mimetype == 'application/javascript') \
+            and charset and 'charset' not in mimetype:
+            mimetype += '; charset=%s' % charset
+        headers['Content-Type'] = mimetype
+
+    if download:
+        download = os.path.basename(filename if download is True else download)
+        headers['Content-Disposition'] = 'attachment; filename="%s"' % download
+
+    stats = os.stat(filename)
+    headers['Content-Length'] = clen = stats.st_size
+    lm = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime(stats.st_mtime))
+    headers['Last-Modified'] = lm
+    headers['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+
+    async with open_async(location, mode='rb') as _file:
+        body = await _file.read()
+
+    return Response(headers=headers,
+                    content_type=mime_type,
+                    body_bytes=body)
 # --- request and response end ---
 
 
 # --- exceptions start ---
 class LambhoError(Exception):
-    pass
+
+    def __init__(self, message, status_code=None):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
 
 
-class RouteError(LambhoError):
-    pass
+class InvalidUsage(LambhoError):
+    status_code = 400
 
 
 class ServerError(LambhoError):
-
-    status_code = None
-
-    def __init__(self, status_code=None, message=''):
-        super().__init__(message)
-        self.status_code = status_code
-        self.message = message
-
-
-class HTTPError(ServerError):
-    pass
+    status_code = 500
 # --- exceptions end ---
 
 
@@ -276,13 +503,22 @@ class Handler:
     def __init__(self):
         self.handlers = {}
 
-    def response(self, request, exception):
-        handler = self.handlers.get(type(exception), self.default)
+    def add(self, handler, exception=None, status=None):
+        if exception is not None:
+            self.handlers[exception] = handler
+        if status is not None:
+            self.handlers[status] = handler
+
+    def response(self, request, exception=None, status=None):
+        if status is not None:
+            handler = self.handlers.get(status, self.default)
+        else:
+            handler = self.handlers.get(type(exception), self.default)
         response = handler(request=request, exception=exception)
         return response
 
-    def default(self, request, exception):
-        return Response("An error occurred while requesting.", status=500)
+    def default(self, request, exception, status=500):
+        return Response("An error occurred while requesting.", status=status)
 
 
 class Lambho(object):
@@ -314,11 +550,29 @@ class Lambho(object):
     def get(self, uri):
         return self.route(uri, methods=['GET'])
 
+    def post(self, uri):
+        return self.route(uri, methods=['POST'])
+
+    def put(self, uri):
+        return self.route(uri, methods=['PUT'])
+
+    def delete(self, uri):
+        return self.route(uri, methods=['DELETE'])
+
+    def patch(self, uri):
+        return self.route(uri, methods=['PATCH'])
+
+    def error(self, status=500):
+        def wrapper(handler):
+            self.error_handler.add(handler, status=status)
+            return handler
+        return wrapper
+
     async def request_handler(self, request, response_callback):
         handler, args, kwargs = self.router.get(request)
 
         if handler is None:
-            raise ServerError(500, ("'None' was returned while requesting "
+            raise ServerError(("'None' was returned while requesting "
                 "a handler from the router"))
 
         response = handler(request, *args, **kwargs)
@@ -327,20 +581,26 @@ class Lambho(object):
         response = Response(response)
 
         response_callback(response)
-# --- application end ---
 
 
 def wrapper_default_app_method(name):
     @wraps(getattr(Lambho, name))
     def wrapper(*a, **kw):
-        return getattr(app(), name)(*a, **kw)
+        return getattr(default_app(), name)(*a, **kw)
     return wrapper
 
 
 route = wrapper_default_app_method('route')
 get = wrapper_default_app_method('get')
+post = wrapper_default_app_method('post')
+put = wrapper_default_app_method('put')
+delete = wrapper_default_app_method('delete')
+patch = wrapper_default_app_method('patch')
+error = wrapper_default_app_method('error')
+# --- application end ---
 
 
+# --- server start ---
 class Signal:
     stopped = False
 
@@ -350,20 +610,21 @@ current_timestamp = None
 
 def update_current_timestamp(loop):
     global current_timestamp
-    current_timestamp = time()
+    current_timestamp = time.time()
     loop.call_later(1, partial(update_current_timestamp, loop))
 
 
 class Server(asyncio.Protocol):
 
-    def __init__(self, *, loop, request_handler, error_handler,
+    def __init__(self, *, app, loop, request_handler, error_handler,
                  signal=Signal(), connections={},
                  request_timeout=60, request_max_size=None):
+        self.app = app
         self.loop = loop
         self.transport = None
         self.request = None
         self.url = None
-        self.headers = []
+        self.headers = None
         self.request_handler = request_handler
         self.error_handler = error_handler
         self.signal = signal
@@ -385,13 +646,14 @@ class Server(asyncio.Protocol):
 
     def data_received(self, data):
         if self.parser is None:
+            self.headers = []
             self.parser = HttpRequestParser(self)
         self.parser.feed_data(data)
 
     def on_url(self, url):
         self.url = url
 
-    def on_headers(self, name, value):
+    def on_header(self, name, value):
         self.headers.append((name.decode(), value.decode('utf-8')))
 
     def on_headers_complete(self):
@@ -400,8 +662,9 @@ class Server(asyncio.Protocol):
             self.headers.append(('Remote-Addr', '%s:%s' % remote_addr))
 
         self.request = Request(
+            app=self.app,
             url_bytes=self.url,
-            headers=self.headers,
+            headers=CIMultiDict(self.headers),
             version=self.parser.get_http_version(),
             method=self.parser.get_method().decode()
         )
@@ -439,6 +702,7 @@ class Server(asyncio.Protocol):
             self.transport.close()
             return True
         return False
+# --- server end ---
 
 
 def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
@@ -459,6 +723,7 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
     signal = Signal()
     server_factory = partial(
         server,
+        app=app,
         loop=loop,
         connections=connections,
         signal=signal,
@@ -486,7 +751,8 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
 
     try:
         logger.debug(Config.LOGO)
-        logger.info('Running ...\nAccess by http://{}:{}'.format(host, port))
+        logger.info('Running ...\nAccess by http://{}:{}/  (Press Ctrl+C to quit)'
+            .format(host, port))
         loop.run_forever()
 
     except KeyboardInterrupt:

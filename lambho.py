@@ -369,17 +369,22 @@ class BaseResponse:
             self.body = body_bytes
 
     def output(self, version="1.1", keep_alive=False):
+        timeout_header = b''
+        if keep_alive:
+            timeout_header = b'Keep-Alive: timeout=%d\r\n' % keep_alive
+
         headers = b''
         if self.headers:
             headers = b''.join(
                 b'%b: %b\r\n' % (name.encode(), value.encode('utf-8'))
                 for name, value in self.headers.iteritems())
+
         return (
             b'HTTP/%b %d %b\r\n'
             b'Content-Type: %b\r\n'
             b'Content-Length: %d\r\n'
             b'Connection: %b\r\n'
-            b'%b\r\n'
+            b'%b%b\r\n'
             b'%b') % (
                 version.encode(),
                 self.status,
@@ -387,6 +392,7 @@ class BaseResponse:
                 self.content_type.encode(),
                 len(self.body),
                 b'keep-alive' if keep_alive else b'close',
+                timeout_header,
                 headers,
                 self.body)
 
@@ -615,6 +621,11 @@ def update_current_timestamp(loop):
 
 
 class Server(asyncio.Protocol):
+    __slots__ = (
+        'app', 'loop', 'transport', 'connections', 'signal',
+        'parser', 'request', 'url', 'headers',
+        'request_handler', 'request_timeout', 'request_max_size',
+        '_total_request_size', '_timeout_handler')
 
     def __init__(self, *, app, loop, request_handler, error_handler,
                  signal=Signal(), connections={},
@@ -624,6 +635,7 @@ class Server(asyncio.Protocol):
         self.transport = None
         self.request = None
         self.url = None
+        self.parser = None
         self.headers = None
         self.request_handler = request_handler
         self.error_handler = error_handler
@@ -631,29 +643,55 @@ class Server(asyncio.Protocol):
         self.connections = connections
         self.request_timeout = request_timeout
         self.request_max_size = request_max_size
+        self._total_request_size = 0
+        self._timeout_handler = None
+        self._last_request_time = None
         self._request_handler_task = None
-        self.parser = None
 
     def connection_made(self, transport):
         self.connections.add(self)
+        self._timeout_handler = self.loop.call_later(
+            self.request_timeout, self.connection_timeout)
         self.transport = transport
+        self._last_request_time = current_time
 
     def connection_lost(self, exception):
         self.connections.discard(self)
+        self._timeout_handler.cancel()
+        self.cleanup()
 
     def connection_timeout(self):
-        pass
+        time_elapsed = current_time - self._last_request_time
+        if time_elapsed < self.request_timeout:
+            time_left = self.request_timeout - time_elapsed
+            self._timeout_handler = \
+                self.loop.call_later(time_left, self.connection_timeout)
+        else:
+            if self._request_handler_task:
+                self._request_handler_task.cancel()
+            self.write_error(ServerError('Request Timeout'))
 
     def data_received(self, data):
+        self._total_request_size += len(data)
+        if self._total_request_size > self.request_max_size:
+            self.write_error(ServerError('Payload Too Large'))
+
         if self.parser is None:
             self.headers = []
             self.parser = HttpRequestParser(self)
-        self.parser.feed_data(data)
+
+        try:
+            self.parser.feed_data(data)
+        except HttpParserError:
+            self.write_error(ServerError('Bad Request'))
 
     def on_url(self, url):
         self.url = url
 
     def on_header(self, name, value):
+        if name == b'Content-Length' and int(value) > self.request_max_size:
+            self.write_error(ServerError('Payload Too Large'))
+
         self.headers.append((name.decode(), value.decode('utf-8')))
 
     def on_headers_complete(self):
@@ -683,10 +721,17 @@ class Server(asyncio.Protocol):
         try:
             keep_alive = self.parser.should_keep_alive() \
                 and not self.signal.stopped
-            self.transport.write(response.output(self.request.version))
-            self.transport.close()
+            self.transport.write(
+                response.output(
+                    self.request.version, keep_alive, self.request_timeout))
+            if not keep_alive:
+                self.transport.close()
+            else:
+                self._last_request_time = current_time
+                self.cleanup()
         except Exception as e:
-            logger.exception("Excepting while writing response.")
+            self.release(
+                "Writing response failed, connection closed {}".format(e))
 
     def write_error(self, exception):
         try:
@@ -695,7 +740,17 @@ class Server(asyncio.Protocol):
             self.transport.write(response.output(version))
             self.transport.close()
         except Exception as e:
-            logger.exception("Excepting while writing error.")
+            self.release(
+                "Writing error failed, connection closed {}".format(e))
+
+    def release(self, message):
+        self.write_error(ServerError(message))
+        logger.error(message)
+
+    def cleanup(self):
+        self.parser, self.request, self.url = None, None, None
+        self.headers, self._request_handler_task = None, None
+        self._total_request_size = 0
 
     def close_if_idle(self):
         if not self.parser:

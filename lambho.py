@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # encoding: utf-8
+import os
 import re
 import sys
 import hmac
@@ -10,13 +11,17 @@ import asyncio
 import hashlib
 import logging
 
+from os import path
+from aiofiles.os import stat
 from cgi import parse_header
 from inspect import isawaitable
 from httptools import parse_url
+from urllib.parse import unquote
 from mimetypes import guess_type
 from traceback import format_exc
 from urllib.parse import parse_qs
 from multidict import CIMultiDict
+from time import strftime, gmtime
 from signal import SIGINT, SIGTERM
 from http.cookies import SimpleCookie
 from aiofiles import open as open_async
@@ -109,6 +114,7 @@ class Router:
         self.all_routes = {}
         self.static_routes = {}
         self.dynamic_routes = defaultdict(list)
+        self.checking_routes = []
 
     def add(self, uri, methods, handler):
         """
@@ -127,6 +133,7 @@ class Router:
             methods = frozenset(methods)
 
         parameters= []
+        properties = {"unhashable": None}
 
         def add_parameter(match):
             param = match.group(1)
@@ -137,6 +144,12 @@ class Router:
             _default = (str, pattern)
             _type, pattern = REGEXP_TYPES.get(pattern, _default)
             parameters.append(Parameter(name=param, type=_type))
+
+            if re.search('(^|[^^]){1}/', pattern):
+                properties['unhashable'] = True
+            elif re.search(pattern, '/'):
+                properties['unhashable'] = True
+
             return "({})".format(pattern)
 
         pattern_re = re.sub(r'<(.+?)>', add_parameter, uri)
@@ -146,7 +159,9 @@ class Router:
                       methods=methods, parameters=parameters)
 
         self.all_routes[uri] = route
-        if parameters:
+        if properties['unhashable']:
+            self.checking_routes.append(route)
+        elif parameters:
             self.dynamic_routes[url_hash(uri)].append(route)
         else:
             self.static_routes[uri] = route
@@ -165,7 +180,8 @@ class Router:
         """
         Gets a request handler based on the URL of the request, or raises an
             error
-        :param request: Request object
+        :param url: the request url
+        :param method: the request method
         :return: handler, arguments, keyword arguments
         """
         route = self.static_routes.get(url)
@@ -177,7 +193,12 @@ class Router:
                 if match:
                     break
             else:
-                raise NotFound('Not found {}'.format(url))
+                for route in self.checking_routes:
+                    match = route.pattern.match(url)
+                    if match:
+                        break
+                else:
+                    raise NotFound('Not found {}'.format(url))
 
         if route.methods and method not in route.methods:
             raise MethodNotAllowed('Method not allowed.')
@@ -446,9 +467,10 @@ class BaseResponse:
 
         headers = b''
         if self.headers:
+            # value not always be str
             headers = b''.join(
-                b'%b: %b\r\n' % (name.encode(), value.encode('utf-8'))
-                for name, value in self.headers.iteritems())
+                b'%b: %b\r\n' % (name.encode(), str(value).encode('utf-8'))
+                for name, value in self.headers.items())
 
         cookie = self._cookies.output().encode('utf-8') + b'\r\n' \
             if self._cookies else b''
@@ -591,18 +613,18 @@ async def file(filename, mimetype=True, headers=None,
     if '../' in filename:
         return HTTPError(404, "Invalid file to access.")
     else:
-        filename = os.path.abspath(filename)
+        filename = path.abspath(filename)
 
-    if not os.path.exists(filename) or not os.path.isfile(filename):
+    if not path.exists(filename) or not path.isfile(filename):
         return HTTPError(404, "File does not exist.")
     if not os.access(filename, os.R_OK):
         return HTTPError(403, "You do not have permission to access this file.")
 
     if mimetype is True:
         if download and download is not True:
-            mimetype, encoding = mimetypes.guess_type(download)
+            mimetype, encoding = guess_type(download)
         else:
-            mimetype, encoding = mimetypes.guess_type(filename)
+            mimetype, encoding = guess_type(filename)
         if encoding:
             headers['Content-Encoding'] = encoding
 
@@ -613,7 +635,7 @@ async def file(filename, mimetype=True, headers=None,
         headers['Content-Type'] = mimetype
 
     if download:
-        download = os.path.basename(filename if download is True else download)
+        download = path.basename(filename if download is True else download)
         headers['Content-Disposition'] = 'attachment; filename="%s"' % download
 
     stats = os.stat(filename)
@@ -622,11 +644,11 @@ async def file(filename, mimetype=True, headers=None,
     headers['Last-Modified'] = lm
     headers['Date'] = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
 
-    async with open_async(location, mode='rb') as _file:
+    async with open_async(filename, mode='rb') as _file:
         body = await _file.read()
 
     return Response(headers=headers,
-                    content_type=mime_type,
+                    content_type=mimetype,
                     body_bytes=body)
 # --- request and response end ---
 
@@ -694,7 +716,7 @@ class Handler:
         return response
 
     def default(self, request, exception):
-        if self.app.config['DEBUG']:
+        if self.app.debug:
             return text("Error: {}\nException: {}".format(
                 exception, format_exc()), status=500)
         elif issubclass(type(exception), LambhoError):
@@ -707,7 +729,7 @@ class Handler:
 class Lambho:
 
     def __init__(self, name=None, router=None, error_handler=None, config=None,
-        logger=None):
+        logger=None, debug=False):
         if logger is None:
             logging.basicConfig(
                 level=logging.INFO,
@@ -719,7 +741,8 @@ class Lambho:
         self.config = config or Config()
         self.error_handler = error_handler or Handler(self)
 
-        self.config.setdefault('DEBUG', False)
+        self.config['DEBUG'] = debug
+        self.debug = debug
 
     def add_route(self, uri, methods, handler):
         self.router.add(uri=uri, methods=methods, handler=handler)
@@ -751,6 +774,38 @@ class Lambho:
             return handler
         return wrapper
 
+    def static(self, uri, file_or_directory, pattern='.+',
+               use_modified_since=True):
+        if not path.isfile(file_or_directory):
+            uri += '<file_uri:' + pattern + '>'
+
+        async def _handler(request, file_uri=None):
+            if file_uri and '../' in file_uri:
+                raise InvalidUsage("Invalid URL.")
+
+            file_path = file_or_directory
+            if file_uri:
+                file_path = path.join(
+                    file_or_directory, re.sub('^[/]*', '', file_uri))
+
+            file_path = unquote(file_path)
+            try:
+                headers = {}
+                if use_modified_since:
+                    stats = await stat(file_path)
+                    modified_since = strftime('%a, %d %b %Y %H:%M:%S GMT',
+                                              gmtime(stats.st_mtime))
+                    if request.headers.get('If-Modified-Since') == modified_since:
+                        return Response(status=304)
+
+                    headers['Last-Modified'] = modified_since
+
+                return await file(file_path, headers=headers)
+            except:
+                raise FileNotFound('File not found.')
+
+        self.route(uri, methods=['GET'])(_handler)
+
     def _handle_response(self, response, request, status_code=_missing):
         response.url = request.url
         response.method = request.method
@@ -761,27 +816,38 @@ class Lambho:
         status_code = _missing
         try:
             handler, args, kwargs = self.router.get(request)
-        except LambhoError as err:
-            status_code = getattr(err, 'status_code', _missing)
+            if handler is None:
+                raise ServerError(("'None' was returned while requesting "
+                    "a handler from the router"))
+
+            response = handler(request, *args, **kwargs)
+            if isawaitable(response):
+                response = await response
+        except Exception as err:
+            status_code = getattr(err, 'status_code', 500)
             if status_code not in self.error_handler.handlers:
-                response = HTTPError(status_code, err.message)
+                if self.debug:
+                    response = HTTPError(status_code,
+                        "Error while handling, error:{}\ntraceback:{}"
+                        .format(err.message, format_exc()))
+                else:
+                    response = HTTPError(status_code,
+                        "An error occurred while handling this request.")
             else:
-                response = self.error_handler.handlers[status_code](request)
-                if isawaitable(response):
-                    response = await response
-                response = HTTPError(status_code, response)
+                try:
+                    response = self.error_handler.handlers[status_code](request)
+                    if isawaitable(response):
+                        response = await response
+                except Exception as e:
+                    status_code = getattr(err, 'status_code', 500)
+                    if self.debug:
+                        response = HTTPError(status_code,
+                            "Error while handling, error:{}\ntraceback:{}"
+                            .format(err.message, format_exc()))
+                    else:
+                        response = HTTPError(status_code,
+                            "An error occurred while handling this request.")
 
-            self._handle_response(response, request, status_code)
-            response_callback(response)
-            return
-
-        if handler is None:
-            raise ServerError(("'None' was returned while requesting "
-                "a handler from the router"))
-
-        response = handler(request, *args, **kwargs)
-        if isawaitable(response):
-            response = await response
         response = Response(response) \
             if not isinstance(response, Response) else response
 
@@ -803,6 +869,7 @@ put = wrapper_default_app_method('put')
 delete = wrapper_default_app_method('delete')
 patch = wrapper_default_app_method('patch')
 error = wrapper_default_app_method('error')
+static = wrapper_default_app_method('static')
 # --- application end ---
 
 
@@ -975,10 +1042,10 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
     asyncio.set_event_loop(loop)
 
     if debug:
-        app.config['DEBUG'] = True
+        app.debug = app.config['DEBUG'] = True
         logger.setLevel(logging.DEBUG)
+        loop.set_debug(debug)
     else:
-        app.config['DEBUG'] = False
         logger.setLevel(logging.INFO)
 
     connections = set()

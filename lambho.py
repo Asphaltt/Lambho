@@ -823,30 +823,27 @@ class Lambho:
             response = handler(request, *args, **kwargs)
             if isawaitable(response):
                 response = await response
-        except Exception as err:
+        except LambhoError as err:
             status_code = getattr(err, 'status_code', 500)
-            if status_code not in self.error_handler.handlers:
-                if self.debug:
-                    response = HTTPError(status_code,
-                        "Error while handling, error:{}\ntraceback:{}"
-                        .format(err.message, format_exc()))
-                else:
-                    response = HTTPError(status_code,
-                        "An error occurred while handling this request.")
-            else:
+            error_message = err.message
+            is_error_custom = False
+            if status_code in self.error_handler.handlers:
                 try:
                     response = self.error_handler.handlers[status_code](request)
                     if isawaitable(response):
                         response = await response
+                    is_error_custom = True
                 except Exception as e:
-                    status_code = getattr(err, 'status_code', 500)
-                    if self.debug:
-                        response = HTTPError(status_code,
-                            "Error while handling, error:{}\ntraceback:{}"
-                            .format(err.message, format_exc()))
-                    else:
-                        response = HTTPError(status_code,
-                            "An error occurred while handling this request.")
+                    error_message = e
+
+            if not is_error_custom:
+                if self.debug:
+                    response = HTTPError(status_code,
+                        "Error while handling, error:{}\ntraceback:{}"
+                        .format(error_message, format_exc()))
+                else:
+                    response = HTTPError(status_code,
+                        "An error occurred while handling this request.")
 
         response = Response(response) \
             if not isinstance(response, Response) else response

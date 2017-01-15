@@ -2,15 +2,19 @@
 # encoding: utf-8
 import re
 import sys
+import hmac
 import time
-import asyncio
+import base64
 import uvloop
+import asyncio
+import hashlib
 import logging
 
 from cgi import parse_header
 from inspect import isawaitable
 from httptools import parse_url
 from mimetypes import guess_type
+from traceback import format_exc
 from urllib.parse import parse_qs
 from multidict import CIMultiDict
 from signal import SIGINT, SIGTERM
@@ -20,6 +24,7 @@ from functools import wraps, partial, lru_cache
 from collections import namedtuple, defaultdict
 from httptools import HttpRequestParser, parse_url
 from ujson import dumps as json_dumps, loads as json_loads
+from datetime import date as datedate, datetime, timedelta
 
 
 class AppStack(list):
@@ -43,14 +48,21 @@ class AppStack(list):
 
 default_app = AppStack()
 logger = logging.getLogger(__name__)
+debug = logger.debug
+info = logger.info
+warning = logger.warning
+error = logger.error
+exception = logger.exception
+
+_missing = object()
 
 
 # --- config start ---
 class Config(dict):
-    LOGO = """
+    LOGO = r"""
 ______                   ______ ______
 ___  / ______ _______ ______  /____  /_______      ▁▁▁▁▁▁▁▁▁▁▁▁▁
-__  /  _  __ `/_  __ `__ \\_  __ \\_  __ \\  __ \\    /            /
+__  /  _  __ `/_  __ `__ \_  __ \_  __ \  __ \    /            /
 _  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /   /  Run fast! /
 /_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/   /▁▁▁▁▁▁▁▁▁▁▁▁/
     """
@@ -165,10 +177,10 @@ class Router:
                 if match:
                     break
             else:
-                raise ServerError('Not found {}.'.format(url), 404)
+                raise NotFound('Not found {}'.format(url))
 
         if route.methods and method not in route.methods:
-            raise ServerError('Method not found.', 405)
+            raise MethodNotAllowed('Method not allowed.')
 
         kwargs = {p.name: p.type(value) for value, p
                   in zip(match.groups(1), route.parameters)}
@@ -346,19 +358,32 @@ def parse_multipart_form(body, boundary):
 Request = BaseRequest
 
 
+def to_bytes(data, encoding='utf-8'):
+    return data.encode(encoding)
+
+
+def to_unicode(s, enc='utf8', err='strict'):
+    if isinstance(s, bytes):
+        return s.decode(enc, err)
+    else:
+        return str(s or ("" if s is None else s))
+
+
 class BaseResponse:
     """
     Basic response of an HTTP request.
     """
-    __slots__ = ('body', 'status', 'message', 'content_type', 'headers', '_cookies')
+    __slots__ = ('body', 'status', 'message', 'content_type', 'headers', '_cookies', 'url', 'method')
 
     def __init__(self, body=None, status=200, content_type='text/plain',
-                 headers=None, message=b'OK', body_bytes=b''):
+                 headers=None, body_bytes=b''):
         self.status = status
-        self.message = message
+        self.message = self._get_message(status)
         self.content_type = content_type
         self.headers = headers or {}
         self._cookies = None
+        self.url = None
+        self.method = None
 
         if body is not None:
             try:
@@ -367,6 +392,52 @@ class BaseResponse:
                 self.body = str(body).encode('utf-8')
         else:
             self.body = body_bytes
+
+    def _get_message(self, status_code):
+        if status_code in COMMON_STATUS_CODES:
+            return COMMON_STATUS_CODES[status_code]
+        return ALL_STATUS_CODES.get(status_code, b'OK')
+
+    def set_cookie(self, name, value, secret=None,
+                   digestmethod=hashlib.sha256, **options):
+        if not self._cookies:
+            self._cookies = SimpleCookie()
+
+        if not isinstance(value, str):
+            raise ValueError("Value of cookie can only be str.")
+
+        if secret:
+            encoded = base64.b64encode(pickle.dumps([name, value], -1))
+            sig = base64.b64encode(
+                hmac.new(tob(secret), encoded, digestmod=digestmod).digest())
+            value = to_unicode(to_bytes('!') + sig + to_bytes('?') + encoded)
+
+        if len(name) + len(value) > 3800:
+            raise ValueError('Content is too long.')
+
+        self._cookies[name] = value
+
+        if not options:
+            return
+
+        for key, value in options.items():
+            if key == 'max_age':
+                if isinstance(value, timedelta):
+                    value = value.seconds + value.days * 24 * 3600
+            if key == 'expires':
+                if isinstance(value, (datedate, datetime)):
+                    value = value.timetuple()
+                elif isinstance(value, (int, float)):
+                    value = time.gmtime(value)
+                value = time.strftime("%a, %d %b %Y %H:%M:%S GMT", value)
+            if key in ('secure', 'httponly') and not value:
+                continue
+            self._cookies[name][key.replace('_', '-')] = value
+
+    def delete_cookie(self, name, **kwargs):
+        kwargs['max_age'] = -1
+        kwargs['expires'] = 0
+        self.set_cookie(name, '', **kwargs)
 
     def output(self, version="1.1", keep_alive=False):
         timeout_header = b''
@@ -379,12 +450,14 @@ class BaseResponse:
                 b'%b: %b\r\n' % (name.encode(), value.encode('utf-8'))
                 for name, value in self.headers.iteritems())
 
+        cookie = self._cookies.output().encode('utf-8') + b'\r\n' \
+            if self._cookies else b''
         return (
             b'HTTP/%b %d %b\r\n'
             b'Content-Type: %b\r\n'
             b'Content-Length: %d\r\n'
             b'Connection: %b\r\n'
-            b'%b%b\r\n'
+            b'%b%b%b\r\n'
             b'%b') % (
                 version.encode(),
                 self.status,
@@ -394,13 +467,86 @@ class BaseResponse:
                 b'keep-alive' if keep_alive else b'close',
                 timeout_header,
                 headers,
+                cookie,
                 self.body)
+
+
+COMMON_STATUS_CODES = {
+    200: b'OK',
+    400: b'Bad Request',
+    404: b'Not Found',
+    500: b'Internal Server Error',
+}
+ALL_STATUS_CODES = {
+    100: b'Continue',
+    101: b'Switching Protocols',
+    102: b'Processing',
+    200: b'OK',
+    201: b'Created',
+    202: b'Accepted',
+    203: b'Non-Authoritative Information',
+    204: b'No Content',
+    205: b'Reset Content',
+    206: b'Partial Content',
+    207: b'Multi-Status',
+    208: b'Already Reported',
+    226: b'IM Used',
+    300: b'Multiple Choices',
+    301: b'Moved Permanently',
+    302: b'Found',
+    303: b'See Other',
+    304: b'Not Modified',
+    305: b'Use Proxy',
+    307: b'Temporary Redirect',
+    308: b'Permanent Redirect',
+    400: b'Bad Request',
+    401: b'Unauthorized',
+    402: b'Payment Required',
+    403: b'Forbidden',
+    404: b'Not Found',
+    405: b'Method Not Allowed',
+    406: b'Not Acceptable',
+    407: b'Proxy Authentication Required',
+    408: b'Request Timeout',
+    409: b'Conflict',
+    410: b'Gone',
+    411: b'Length Required',
+    412: b'Precondition Failed',
+    413: b'Request Entity Too Large',
+    414: b'Request-URI Too Long',
+    415: b'Unsupported Media Type',
+    416: b'Requested Range Not Satisfiable',
+    417: b'Expectation Failed',
+    422: b'Unprocessable Entity',
+    423: b'Locked',
+    424: b'Failed Dependency',
+    426: b'Upgrade Required',
+    428: b'Precondition Required',
+    429: b'Too Many Requests',
+    431: b'Request Header Fields Too Large',
+    500: b'Internal Server Error',
+    501: b'Not Implemented',
+    502: b'Bad Gateway',
+    503: b'Service Unavailable',
+    504: b'Gateway Timeout',
+    505: b'HTTP Version Not Supported',
+    506: b'Variant Also Negotiates',
+    507: b'Insufficient Storage',
+    508: b'Loop Detected',
+    510: b'Not Extended',
+    511: b'Network Authentication Required'
+}
 
 
 class HTTPError(BaseResponse):
 
     def __init__(self, status, message):
-        super().__init__(status=status, message=message)
+        body_bytes = message.encode('utf-8')
+        try:
+            status = int(status)
+        except:
+            status = 500
+        super().__init__(status=status, body_bytes=body_bytes)
 
 
 Response = BaseResponse
@@ -490,8 +636,17 @@ class LambhoError(Exception):
 
     def __init__(self, message, status_code=None):
         super().__init__(message)
+        self.message = message
         if status_code is not None:
             self.status_code = status_code
+
+
+class NotFound(LambhoError):
+    status_code = 404
+
+
+class MethodNotAllowed(LambhoError):
+    status_code = 405
 
 
 class InvalidUsage(LambhoError):
@@ -500,13 +655,31 @@ class InvalidUsage(LambhoError):
 
 class ServerError(LambhoError):
     status_code = 500
+
+
+class FileNotFound(LambhoError):
+    status_code = 404
+
+    def __init__(self, message, path, relative_url):
+        super().__init__(message)
+        self.path = path
+        self.relative_url = relative_url
+
+
+class RequestTimeout(LambhoError):
+    status_code = 408
+
+
+class PayloadTooLarge(LambhoError):
+    status_code = 413
 # --- exceptions end ---
 
 
 # --- application start ---
 class Handler:
 
-    def __init__(self):
+    def __init__(self, app):
+        self.app = app
         self.handlers = {}
 
     def add(self, handler, exception=None, status=None):
@@ -515,19 +688,23 @@ class Handler:
         if status is not None:
             self.handlers[status] = handler
 
-    def response(self, request, exception=None, status=None):
-        if status is not None:
-            handler = self.handlers.get(status, self.default)
-        else:
-            handler = self.handlers.get(type(exception), self.default)
+    def response(self, request, exception=None):
+        handler = self.handlers.get(type(exception), self.default)
         response = handler(request=request, exception=exception)
         return response
 
-    def default(self, request, exception, status=500):
-        return Response("An error occurred while requesting.", status=status)
+    def default(self, request, exception):
+        if self.app.config['DEBUG']:
+            return text("Error: {}\nException: {}".format(
+                exception, format_exc()), status=500)
+        elif issubclass(type(exception), LambhoError):
+            return text("Error: {}".format(exception),
+                status=getattr(exception, 'status_code', 500))
+        else:
+            return text("An error occurred while requesting.", status=500)
 
 
-class Lambho(object):
+class Lambho:
 
     def __init__(self, name=None, router=None, error_handler=None, config=None,
         logger=None):
@@ -540,7 +717,7 @@ class Lambho(object):
         self.name = name or "Lambho"
         self.router = router or Router()
         self.config = config or Config()
-        self.error_handler = error_handler or Handler()
+        self.error_handler = error_handler or Handler(self)
 
         self.config.setdefault('DEBUG', False)
 
@@ -574,8 +751,29 @@ class Lambho(object):
             return handler
         return wrapper
 
+    def _handle_response(self, response, request, status_code=_missing):
+        response.url = request.url
+        response.method = request.method
+        if status_code is not _missing:
+            response.status = status_code
+
     async def request_handler(self, request, response_callback):
-        handler, args, kwargs = self.router.get(request)
+        status_code = _missing
+        try:
+            handler, args, kwargs = self.router.get(request)
+        except LambhoError as err:
+            status_code = getattr(err, 'status_code', _missing)
+            if status_code not in self.error_handler.handlers:
+                response = HTTPError(status_code, err.message)
+            else:
+                response = self.error_handler.handlers[status_code](request)
+                if isawaitable(response):
+                    response = await response
+                response = HTTPError(status_code, response)
+
+            self._handle_response(response, request, status_code)
+            response_callback(response)
+            return
 
         if handler is None:
             raise ServerError(("'None' was returned while requesting "
@@ -584,8 +782,10 @@ class Lambho(object):
         response = handler(request, *args, **kwargs)
         if isawaitable(response):
             response = await response
-        response = Response(response)
+        response = Response(response) \
+            if not isinstance(response, Response) else response
 
+        self._handle_response(response, request, status_code)
         response_callback(response)
 
 
@@ -627,7 +827,7 @@ class Server(asyncio.Protocol):
         'request_handler', 'request_timeout', 'request_max_size',
         '_total_request_size', '_timeout_handler')
 
-    def __init__(self, *, app, loop, request_handler, error_handler,
+    def __init__(self, *, app, loop,
                  signal=Signal(), connections={},
                  request_timeout=60, request_max_size=None):
         self.app = app
@@ -637,8 +837,8 @@ class Server(asyncio.Protocol):
         self.url = None
         self.parser = None
         self.headers = None
-        self.request_handler = request_handler
-        self.error_handler = error_handler
+        self.request_handler = app.request_handler
+        self.error_handler = app.error_handler
         self.signal = signal
         self.connections = connections
         self.request_timeout = request_timeout
@@ -653,7 +853,7 @@ class Server(asyncio.Protocol):
         self._timeout_handler = self.loop.call_later(
             self.request_timeout, self.connection_timeout)
         self.transport = transport
-        self._last_request_time = current_time
+        self._last_request_time = current_timestamp
 
     def connection_lost(self, exception):
         self.connections.discard(self)
@@ -661,7 +861,7 @@ class Server(asyncio.Protocol):
         self.cleanup()
 
     def connection_timeout(self):
-        time_elapsed = current_time - self._last_request_time
+        time_elapsed = current_timestamp - self._last_request_time
         if time_elapsed < self.request_timeout:
             time_left = self.request_timeout - time_elapsed
             self._timeout_handler = \
@@ -669,12 +869,13 @@ class Server(asyncio.Protocol):
         else:
             if self._request_handler_task:
                 self._request_handler_task.cancel()
-            self.write_error(ServerError('Request Timeout'))
+            self.write_error(ServerError('Request Timeout', 504))
 
     def data_received(self, data):
         self._total_request_size += len(data)
-        if self._total_request_size > self.request_max_size:
-            self.write_error(ServerError('Payload Too Large'))
+        if self.request_max_size is not None:
+            if self._total_request_size > self.request_max_size:
+                self.write_error(PayloadTooLarge('Payload Too Large'))
 
         if self.parser is None:
             self.headers = []
@@ -683,14 +884,15 @@ class Server(asyncio.Protocol):
         try:
             self.parser.feed_data(data)
         except HttpParserError:
-            self.write_error(ServerError('Bad Request'))
+            self.write_error(InvalidUsage('Bad Request'))
 
     def on_url(self, url):
         self.url = url
 
     def on_header(self, name, value):
-        if name == b'Content-Length' and int(value) > self.request_max_size:
-            self.write_error(ServerError('Payload Too Large'))
+        if self.request_max_size is not None:
+            if name == b'Content-Length' and int(value) > self.request_max_size:
+                self.write_error(PayloadTooLarge('Payload Too Large'))
 
         self.headers.append((name.decode(), value.decode('utf-8')))
 
@@ -721,17 +923,21 @@ class Server(asyncio.Protocol):
         try:
             keep_alive = self.parser.should_keep_alive() \
                 and not self.signal.stopped
-            self.transport.write(
-                response.output(
-                    self.request.version, keep_alive, self.request_timeout))
+            keep_alive = self.request_timeout if keep_alive else keep_alive
+            output = response.output(self.request.version, keep_alive)
+            self.transport.write(output)
+
             if not keep_alive:
                 self.transport.close()
             else:
-                self._last_request_time = current_time
+                self._last_request_time = current_timestamp
                 self.cleanup()
+
+            logger.info("{} {} {}".format(
+                response.method, response.url, response.status))
         except Exception as e:
             self.release(
-                "Writing response failed, connection closed {}".format(e))
+                "Writing response failed, connection closed, because \"{}\"".format(e))
 
     def write_error(self, exception):
         try:
@@ -741,7 +947,7 @@ class Server(asyncio.Protocol):
             self.transport.close()
         except Exception as e:
             self.release(
-                "Writing error failed, connection closed {}".format(e))
+                "Writing error failed, connection closed, because \"{}\"".format(e))
 
     def release(self, message):
         self.write_error(ServerError(message))
@@ -762,7 +968,7 @@ class Server(asyncio.Protocol):
 
 def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         request_max_size=None, reuse_port=False, server=None, loop=None,
-        debug=False):
+        sock=None, debug=False):
     app = app or default_app()
     server = server or Server
     loop = loop or uvloop.new_event_loop()
@@ -772,6 +978,7 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         app.config['DEBUG'] = True
         logger.setLevel(logging.DEBUG)
     else:
+        app.config['DEBUG'] = False
         logger.setLevel(logging.INFO)
 
     connections = set()
@@ -782,15 +989,13 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         loop=loop,
         connections=connections,
         signal=signal,
-        request_handler=app.request_handler,
-        error_handler=app.error_handler,
         request_timeout=request_timeout,
         request_max_size=request_max_size,
     )
 
     coro = loop.create_server(
         server_factory, host, port, reuse_port=reuse_port,
-        sock=None
+        sock=sock
     )
 
     loop.call_soon(partial(update_current_timestamp, loop))

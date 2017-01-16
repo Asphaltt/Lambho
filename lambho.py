@@ -21,10 +21,11 @@ from mimetypes import guess_type
 from traceback import format_exc
 from urllib.parse import parse_qs
 from multidict import CIMultiDict
-from time import strftime, gmtime
-from signal import SIGINT, SIGTERM
 from http.cookies import SimpleCookie
 from aiofiles import open as open_async
+from time import strftime, gmtime, sleep
+from multiprocessing import Process, Event
+from signal import signal, SIGINT, SIGTERM
 from functools import wraps, partial, lru_cache
 from collections import namedtuple, defaultdict
 from httptools import HttpRequestParser, parse_url
@@ -52,6 +53,8 @@ class AppStack(list):
 
 
 default_app = AppStack()
+_missing = object()
+
 logger = logging.getLogger(__name__)
 debug = logger.debug
 info = logger.info
@@ -59,19 +62,22 @@ warning = logger.warning
 error = logger.error
 exception = logger.exception
 
-_missing = object()
-
 
 # --- config start ---
 class Config(dict):
     LOGO = r"""
 ______                   ______ ______
-___  / ______ _______ ______  /____  /_______      ▁▁▁▁▁▁▁▁▁▁▁▁▁
-__  /  _  __ `/_  __ `__ \_  __ \_  __ \  __ \    /            /
-_  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /   /  Run fast! /
-/_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/   /▁▁▁▁▁▁▁▁▁▁▁▁/
+___  / ______ _______ ______  /____  /_______      ▁▁▁▁▁▁▁▁▁▁▁▁▁▁
+__  /  _  __ `/_  __ `__ \_  __ \_  __ \  __ \    /             /
+_  /___/ /_/ /_  / / / / /  /_/ /  / / / /_/ /   / Drive fast! /
+/_____/\__,_/ /_/ /_/ /_//_.___//_/ /_/\____/   /▁▁▁▁▁▁▁▁▁▁▁▁▁/
     """
+    REQUEST_MAX_SIZE = 100000000  # 100 megababies
+    REQUEST_TIMEOUT = 60  # 60 seconds
     ROUTE_CACHE_SIZE = 1024
+
+    LOG_LEVEL = logging.INFO
+    LOG_FORMAT = "%(asctime)s %(levelname)s %(message)s"
 # --- config end ---
 
 
@@ -728,14 +734,8 @@ class Handler:
 
 class Lambho:
 
-    def __init__(self, name=None, router=None, error_handler=None, config=None,
-        logger=None, debug=False):
-        if logger is None:
-            logging.basicConfig(
-                level=logging.INFO,
-                format="%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
-            )
-
+    def __init__(self, name=None, router=None, error_handler=None,
+        config=None, debug=False):
         self.name = name or "Lambho"
         self.router = router or Router()
         self.config = config or Config()
@@ -743,6 +743,11 @@ class Lambho:
 
         self.config['DEBUG'] = debug
         self.debug = debug
+
+        logging.basicConfig(
+            level=self.config.LOG_LEVEL,
+            format=self.config.LOG_FORMAT
+        )
 
     def add_route(self, uri, methods, handler):
         self.router.add(uri=uri, methods=methods, handler=handler)
@@ -891,9 +896,7 @@ class Server(asyncio.Protocol):
         'request_handler', 'request_timeout', 'request_max_size',
         '_total_request_size', '_timeout_handler')
 
-    def __init__(self, *, app, loop,
-                 signal=Signal(), connections={},
-                 request_timeout=60, request_max_size=None):
+    def __init__(self, *, app, loop, signal=Signal(), connections={}):
         self.app = app
         self.loop = loop
         self.transport = None
@@ -905,8 +908,8 @@ class Server(asyncio.Protocol):
         self.error_handler = app.error_handler
         self.signal = signal
         self.connections = connections
-        self.request_timeout = request_timeout
-        self.request_max_size = request_max_size
+        self.request_timeout = app.config.REQUEST_TIMEOUT
+        self.request_max_size = app.config.REQUEST_MAX_SIZE
         self._total_request_size = 0
         self._timeout_handler = None
         self._last_request_time = None
@@ -1030,20 +1033,21 @@ class Server(asyncio.Protocol):
 # --- server end ---
 
 
-def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
-        request_max_size=None, reuse_port=False, server=None, loop=None,
-        sock=None, debug=False):
-    app = app or default_app()
-    server = server or Server
+def stop():
+    """
+    Kill the lambho.
+    """
+    asyncio.get_event_loop().stop()
+
+
+def _run(*, app, host, port, server=None, loop=None,
+    reuse_port=False, sock=None, debug=False):
     loop = loop or uvloop.new_event_loop()
+    server = server or Server
     asyncio.set_event_loop(loop)
 
     if debug:
-        app.debug = app.config['DEBUG'] = True
-        logger.setLevel(logging.DEBUG)
         loop.set_debug(debug)
-    else:
-        logger.setLevel(logging.INFO)
 
     connections = set()
     signal = Signal()
@@ -1053,12 +1057,13 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         loop=loop,
         connections=connections,
         signal=signal,
-        request_timeout=request_timeout,
-        request_max_size=request_max_size,
     )
 
     coro = loop.create_server(
-        server_factory, host, port, reuse_port=reuse_port,
+        server_factory,
+        host,
+        port,
+        reuse_port=reuse_port,
         sock=sock
     )
 
@@ -1074,11 +1079,7 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
         loop.add_signal_handler(_signal, loop.stop)
 
     try:
-        logger.debug(Config.LOGO)
-        logger.info('Running ...\nAccess by http://{}:{}/  (Press Ctrl+C to quit)'
-            .format(host, port))
         loop.run_forever()
-
     except KeyboardInterrupt:
         pass
     except (SystemExit, MemoryError):
@@ -1097,3 +1098,68 @@ def run(app=None, host='127.0.0.1', port=5000, request_timeout=60,
             loop.run_until_complete(asyncio.sleep(0.1))
 
         loop.close()
+
+
+def _run_multiple(server_settings, workers, stop_event=None):
+    server_settings['reuse_port'] = True
+
+    stop_event = stop_event or Event()
+    signal(SIGINT, lambda s, f: stop_event.set())
+    signal(SIGTERM, lambda s, f: stop_event.set())
+
+    processes = []
+    for _ in range(workers):
+        process = Process(target=_run, kwargs=server_settings)
+        process.start()
+        processes.append(process)
+
+    # Infinitely wait for the stop event
+    try:
+        while not stop_event.is_set():
+            sleep(0.3)
+    except:
+        pass
+
+    logger.info('Firing drivers...')
+    for process in processes:
+        process.terminate()
+    for process in processes:
+        process.join()
+
+
+def run(app=None, host='127.0.0.1', port=5000,
+        reuse_port=False, server=None, loop=None,
+        sock=None, debug=False, workers=1):
+    app = app or default_app()
+
+    server_settings = {
+        'app': app,
+        'loop': loop,
+        'host': host,
+        'port': port,
+        'sock': sock,
+        'debug': debug,
+        'server': server,
+        'reuse_port': reuse_port,
+    }
+
+    if debug:
+        app.debug = app.config['DEBUG'] = True
+        logger.setLevel(logging.DEBUG)
+
+    logger.debug(Config.LOGO)
+    logger.info('Running @ http://{}:{}  (Press Ctrl+C to quit)'
+        .format(host, port))
+
+    try:
+        if workers == 1:
+            _run(**server_settings)
+        else:
+            logger.info('Hiring {} drivers...'.format(workers))
+
+            _run_multiple(server_settings, workers)
+
+    except Exception as e:
+        logger.exception(e)
+
+    logger.info("Server stopped.")
